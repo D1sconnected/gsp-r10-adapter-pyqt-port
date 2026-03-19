@@ -10,6 +10,7 @@
   "bluetooth": {
     "enabled": true, //bluetooth enabled
     "bluetoothDeviceName": "Approach R10",
+    "bluetoothDeviceMac": "C5:54:45:55:8E:06", // MAC address of the device (optional, bypasses name lookup)
     "reconnectInterval": 10, // seconds
     "sendStatusChangesToGSP": false, // send device readiness updates to gsp (does nothing as of today)
     "autoWake": true, // wake device if falls asleep

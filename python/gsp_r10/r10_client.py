@@ -3,6 +3,7 @@
 import asyncio
 from collections.abc import Awaitable, Callable
 import logging
+import platform
 
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -25,6 +26,11 @@ from gsp_r10.protocol import (
 from gsp_r10.proto import launch_monitor_pb2 as proto
 
 LOGGER = logging.getLogger(__name__)
+LINUX_INTERFACE_NOTIFY_CANDIDATES = [
+    DEVICE_INTERFACE_NOTIFIER_UUID,
+    "6A4E2810-667B-11E3-949A-0800200C9A66",
+    "6A4E2811-667B-11E3-949A-0800200C9A66",
+]
 
 
 class R10Client:
@@ -45,6 +51,7 @@ class R10Client:
         self._battery: int | None = None
         self._seen_shot_ids: set[int] = set()
         self._ready_event = asyncio.Event()
+        self._interface_notifier_uuid = DEVICE_INTERFACE_NOTIFIER_UUID
 
     async def connect(self) -> None:
         self.ble_device = await self._find_device()
@@ -112,14 +119,54 @@ class R10Client:
         assert self.client is not None
         LOGGER.debug("Subscribing to measurement service")
         await self.client.start_notify("6A4E3401-667B-11E3-949A-0800200C9A66", self._ignore_notification)
+        await asyncio.sleep(0.2)
         LOGGER.debug("Subscribing to control service")
         await self.client.start_notify(CONTROL_POINT_CHARACTERISTIC_UUID, self._ignore_notification)
+        await asyncio.sleep(0.2)
         LOGGER.debug("Subscribing to status service")
         await self.client.start_notify(STATUS_CHARACTERISTIC_UUID, self._status_notification)
+        await asyncio.sleep(0.2)
         LOGGER.debug("Reading battery service")
         await self.client.start_notify(BATTERY_CHARACTERISTIC_UUID, self._battery_notification)
+        await asyncio.sleep(0.2)
         LOGGER.debug("Setting up device interface service")
-        await self.client.start_notify(DEVICE_INTERFACE_NOTIFIER_UUID, self._device_interface_notification)
+        await self._start_device_interface_notifications()
+
+    async def _start_device_interface_notifications(self) -> None:
+        assert self.client is not None
+        candidates = [DEVICE_INTERFACE_NOTIFIER_UUID]
+        if platform.system() == "Linux":
+            candidates = LINUX_INTERFACE_NOTIFY_CANDIDATES
+
+        last_error: Exception | None = None
+        for candidate in candidates:
+            for attempt in range(1, 4):
+                try:
+                    LOGGER.debug(
+                        "Subscribing to Garmin interface notifier %s (attempt %s/3)",
+                        candidate,
+                        attempt,
+                    )
+                    await self.client.start_notify(candidate, self._device_interface_notification)
+                    self._interface_notifier_uuid = candidate
+                    LOGGER.info("Using Garmin interface notifier %s", candidate)
+                    return
+                except Exception as exc:
+                    last_error = exc
+                    LOGGER.warning(
+                        "Failed to subscribe to Garmin interface notifier %s on attempt %s: %s",
+                        candidate,
+                        attempt,
+                        exc,
+                    )
+                    await asyncio.sleep(0.5)
+                    if not self.client.is_connected:
+                        raise
+            LOGGER.warning("Moving to next Garmin interface notifier candidate after %s", candidate)
+
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("Could not subscribe to any Garmin interface notifier characteristic")
 
     async def _read_device_info(self) -> dict:
         assert self.client is not None

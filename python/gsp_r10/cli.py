@@ -75,6 +75,13 @@ def main() -> None:
         level=logging.DEBUG if args.debug else logging.INFO,
         format="%(asctime)s %(levelname)7s %(name)s || %(message)s",
     )
+    if args.debug:
+        logging.getLogger("bleak").setLevel(logging.INFO)
+        logging.getLogger("bleak.backends.bluezdbus").setLevel(logging.INFO)
+        logging.getLogger("bleak.backends.bluezdbus.manager").setLevel(logging.INFO)
+        logging.getLogger("bleak.backends.bluezdbus.client").setLevel(logging.INFO)
+        logging.getLogger("bleak.backends.winrt").setLevel(logging.INFO)
+        logging.getLogger("asyncio").setLevel(logging.INFO)
     asyncio.run(_run(args))
 
 

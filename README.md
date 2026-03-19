@@ -43,3 +43,22 @@ In order to use the putting integration you must
 
 - Install a dotnet 7 sdk if you don't have one already
 - `dotnet run` from project directory
+## Python Port Scaffold
+
+A headless Python scaffold now lives under `python/gsp_r10`.
+It is intended to keep the BLE and Garmin protocol logic as close as possible to the existing C# implementation before any PyQt UI work starts.
+
+### Python setup
+
+- Python package metadata is in `pyproject.toml`
+- BLE transport uses `bleak`
+- Protobuf bindings are generated from `src/bluetooth/proto/LaunchMonitor.proto`
+
+### Python smoke test
+
+From the project root:
+
+- PowerShell: `$env:PYTHONPATH='python'; python -m gsp_r10.cli --config settings.json --scan-only`
+
+That command only validates config loading and startup wiring.
+A real BLE session will be the next step on a Windows 11 machine with the R10 paired and powered on.
