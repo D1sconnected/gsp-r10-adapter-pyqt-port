@@ -26,6 +26,7 @@ MEASUREMENT_SERVICE_UUID = "6A4E3400-667B-11E3-949A-0800200C9A66"
 MEASUREMENT_CHARACTERISTIC_UUID = "6A4E3401-667B-11E3-949A-0800200C9A66"
 CONTROL_POINT_CHARACTERISTIC_UUID = "6A4E3402-667B-11E3-949A-0800200C9A66"
 STATUS_CHARACTERISTIC_UUID = "6A4E3403-667B-11E3-949A-0800200C9A66"
+PROTO_PREFIX_LEN = 16
 
 
 def to_hex(data: bytes | bytearray) -> str:
@@ -129,6 +130,9 @@ class R10Protocol:
         self._pending_response: proto.WrapperProto | None = None
         self._proto_response_event = asyncio.Event()
 
+    def _is_debug_enabled(self) -> bool:
+        return self.debug_logging or LOGGER.isEnabledFor(logging.DEBUG)
+
     async def start(self) -> None:
         self._running = True
         self._reader_task = asyncio.create_task(self._reader_loop(), name="r10-reader")
@@ -143,11 +147,13 @@ class R10Protocol:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def enqueue_ble_chunk(self, data: bytes) -> None:
-        if self.debug_logging:
+        if self._is_debug_enabled():
             LOGGER.debug("      -> %s (ble read)", to_hex(data))
         await self._reader_queue.put(data)
 
     async def perform_handshake(self) -> bool:
+        if self._is_debug_enabled():
+            LOGGER.debug("Starting handshake")
         self._handshake_complete = False
         self._handshake_event.clear()
         self._header = 0x00
@@ -156,29 +162,30 @@ class R10Protocol:
             await asyncio.wait_for(self._handshake_event.wait(), timeout=10)
             return True
         except asyncio.TimeoutError:
+            LOGGER.error("Handshake did not complete")
             return False
 
     async def send_bytes(self, payload: bytes) -> None:
         framed = bytes([self._header]) + payload
-        if self.debug_logging:
+        if self._is_debug_enabled():
             LOGGER.debug("      <- %s (ble write)", to_hex(payload))
         result = self._write_chunk(framed)
         if asyncio.iscoroutine(result):
             await result
 
     async def write_message(self, payload: bytes) -> None:
-        if self.debug_logging:
+        if self._is_debug_enabled():
             LOGGER.debug("<- %s (raw)", to_hex(payload))
 
         length = (2 + len(payload) + 2).to_bytes(2, "little")
         framed = length + payload
         full_frame = framed + crc16(framed)
 
-        if self.debug_logging:
+        if self._is_debug_enabled():
             LOGGER.debug("  <- %s (framed)", to_hex(full_frame))
 
         encoded = b"\x00" + cobs_encode(full_frame) + b"\x00"
-        if self.debug_logging:
+        if self._is_debug_enabled():
             LOGGER.debug("    <- %s (encoded)", to_hex(encoded))
 
         for start in range(0, len(encoded), 19):
@@ -186,14 +193,15 @@ class R10Protocol:
 
     async def send_protobuf_request(self, wrapper: proto.WrapperProto) -> proto.WrapperProto | None:
         self._proto_response_event.clear()
+        self._pending_response = None
         message_bytes = wrapper.SerializeToString()
-        length = len(message_bytes).to_bytes(2, "little")
+        msg_len = len(message_bytes).to_bytes(4, "little")
         full_message = (
             bytes.fromhex("B313")
-            + self._proto_request_counter.to_bytes(2, "little")
+            + self._proto_request_counter.to_bytes(4, "little")
             + b"\x00\x00"
-            + length
-            + length
+            + msg_len
+            + msg_len
             + message_bytes
         )
 
@@ -265,7 +273,7 @@ class R10Protocol:
             payload = msg[1:]
 
             if header == 0 or not self._handshake_complete:
-                self._continue_handshake(payload)
+                await self._continue_handshake(payload)
                 continue
 
             read_complete = False
@@ -279,21 +287,25 @@ class R10Protocol:
             current_message.extend(payload)
 
             if read_complete and current_message:
-                if self.debug_logging:
+                if self._is_debug_enabled():
                     LOGGER.debug("  -> %s (encoded)", to_hex(current_message))
                 decoded = cobs_decode(bytes(current_message))
-                if self.debug_logging:
+                if self._is_debug_enabled():
                     LOGGER.debug("-> %s (decoded)", to_hex(decoded))
                 await self._message_queue.put(decoded)
                 current_message.clear()
 
-    def _continue_handshake(self, payload: bytes) -> None:
+    async def _continue_handshake(self, payload: bytes) -> None:
         payload_hex = to_hex(payload)
+        if self._is_debug_enabled():
+            LOGGER.debug("Handshake candidate: %s", payload_hex)
         if payload_hex.startswith("010000000000000000010000"):
             self._header = payload[12]
-            asyncio.create_task(self.send_bytes(bytes.fromhex("00")))
+            await self.send_bytes(bytes.fromhex("00"))
             self._handshake_complete = True
             self._handshake_event.set()
+            if self._is_debug_enabled():
+                LOGGER.debug("Handshake complete with header %02X", self._header)
 
     async def _processor_loop(self) -> None:
         while self._running:
@@ -318,7 +330,7 @@ class R10Protocol:
             ack_body.extend(bytes.fromhex("00000000000000"))
             if counter == self._proto_request_counter:
                 wrapper = proto.WrapperProto()
-                wrapper.ParseFromString(msg[16:])
+                wrapper.ParseFromString(msg[PROTO_PREFIX_LEN:])
                 self._pending_response = wrapper
                 for callback in self.message_received_callbacks:
                     callback(wrapper)
@@ -327,7 +339,7 @@ class R10Protocol:
             ack_body.extend(msg[2:4])
             ack_body.extend(bytes.fromhex("00000000000000"))
             wrapper = proto.WrapperProto()
-            wrapper.ParseFromString(msg[16:])
+            wrapper.ParseFromString(msg[PROTO_PREFIX_LEN:])
             for callback in self.message_received_callbacks:
                 callback(wrapper)
             await self._handle_protobuf_request(wrapper)
