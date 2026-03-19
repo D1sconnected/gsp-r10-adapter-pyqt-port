@@ -44,6 +44,7 @@ class R10Client:
         self.on_device_info: Callable[[dict], Awaitable[None] | None] | None = None
         self._battery: int | None = None
         self._seen_shot_ids: set[int] = set()
+        self._ready_event = asyncio.Event()
 
     async def connect(self) -> None:
         self.ble_device = await self._find_device()
@@ -134,18 +135,36 @@ class R10Client:
         }
 
     async def _initialize_device(self) -> None:
-        wake = await self.protocol.wake_device()
-        status = await self.protocol.status_request()
-        tilt = await self.protocol.tilt_request()
-        await self.protocol.subscribe_to_alerts()
+        wake = await self._request_with_retries("wakeUpRequest", self.protocol.wake_device, attempts=3, delay=1.0)
+        if wake is None:
+            raise RuntimeError("Failed to wake R10")
+
+        await self._wait_for_ready(timeout=5.0)
+
+        status = await self._request_with_retries("statusRequest", self.protocol.status_request, attempts=3, delay=1.0)
+        tilt = await self._request_with_retries("tiltRequest", self.protocol.tilt_request, attempts=3, delay=1.0)
+        subscribe = await self._request_with_retries("subscribeRequest", self.protocol.subscribe_to_alerts, attempts=3, delay=1.0)
+
+        start_tilt = None
         if self.config.calibrate_tilt_on_connect:
-            await self.protocol.start_tilt_calibration()
-        shot_config = await self.protocol.shot_config(
-            temperature=self.config.temperature,
-            humidity=self.config.humidity,
-            altitude=self.config.altitude,
-            air_density=self.config.air_density,
-            tee_range=self.config.tee_distance_in_feet * FEET_TO_METERS,
+            start_tilt = await self._request_with_retries(
+                "startTiltCalRequest",
+                self.protocol.start_tilt_calibration,
+                attempts=3,
+                delay=1.0,
+            )
+
+        shot_config = await self._request_with_retries(
+            "shotConfigRequest",
+            lambda: self.protocol.shot_config(
+                temperature=self.config.temperature,
+                humidity=self.config.humidity,
+                altitude=self.config.altitude,
+                air_density=self.config.air_density,
+                tee_range=self.config.tee_distance_in_feet * FEET_TO_METERS,
+            ),
+            attempts=3,
+            delay=1.0,
         )
 
         device_info = await self._read_device_info()
@@ -158,8 +177,46 @@ class R10Client:
             LOGGER.info("   Current State: %s", proto.State.StateType.Name(status.service.status_response.state.state))
         if tilt is not None and tilt.service.HasField("tilt_response"):
             LOGGER.info("   Tilt: %s", MessageToDict(tilt.service.tilt_response.tilt, preserving_proto_field_name=True))
-        if wake is None or shot_config is None:
-            raise RuntimeError("Initial R10 setup was incomplete")
+
+        missing = []
+        if status is None:
+            missing.append("status")
+        if tilt is None:
+            missing.append("tilt")
+        if subscribe is None:
+            missing.append("subscribe")
+        if self.config.calibrate_tilt_on_connect and start_tilt is None:
+            missing.append("startTiltCal")
+        if shot_config is None:
+            missing.append("shotConfig")
+        if missing:
+            LOGGER.warning("Setup finished with missing responses: %s", ", ".join(missing))
+
+    async def _request_with_retries(
+        self,
+        label: str,
+        request_factory: Callable[[], Awaitable[object | None]],
+        *,
+        attempts: int,
+        delay: float,
+    ) -> object | None:
+        for attempt in range(1, attempts + 1):
+            response = await request_factory()
+            if response is not None:
+                return response
+            if attempt < attempts:
+                LOGGER.warning("%s timed out; retrying (%s/%s)", label, attempt, attempts)
+                await asyncio.sleep(delay)
+        LOGGER.warning("%s did not return a response after %s attempts", label, attempts)
+        return None
+
+    async def _wait_for_ready(self, timeout: float) -> bool:
+        try:
+            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            LOGGER.warning("R10 did not report ready within %.1f seconds", timeout)
+            return False
 
     async def _write_chunk(self, data: bytes) -> None:
         assert self.client is not None
@@ -172,6 +229,10 @@ class R10Client:
         if len(data) >= 3:
             is_awake = data[1] == 0
             is_ready = data[2] == 0
+            if is_ready:
+                self._ready_event.set()
+            else:
+                self._ready_event.clear()
             LOGGER.debug("Status notification awake=%s ready=%s raw=%s", is_awake, is_ready, bytes(data).hex())
 
     def _battery_notification(self, _: object, data: bytearray) -> None:
@@ -188,6 +249,8 @@ class R10Client:
     def _on_state(self, state: object) -> None:
         state_name = proto.State.StateType.Name(state.state)
         LOGGER.info("State changed: %s", state_name)
+        if state.state == proto.State.WAITING:
+            self._ready_event.set()
         if self.on_state is not None:
             result = self.on_state(state_name)
             if asyncio.iscoroutine(result):
