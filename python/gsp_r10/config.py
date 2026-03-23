@@ -3,6 +3,7 @@
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
+import sys
 from typing import Any
 
 
@@ -119,10 +120,12 @@ def resolve_config_path(path: str | Path) -> Path:
     if candidate.is_absolute() and candidate.exists():
         return candidate
 
-    search_paths = [
-        Path.cwd() / candidate,
-        Path(__file__).resolve().parents[3] / candidate,
-    ]
+    search_paths = [Path.cwd() / candidate]
+
+    if getattr(sys, "frozen", False):
+        search_paths.append(Path(sys.executable).resolve().parent / candidate)
+
+    search_paths.append(Path(__file__).resolve().parents[3] / candidate)
 
     for search_path in search_paths:
         if search_path.exists():
